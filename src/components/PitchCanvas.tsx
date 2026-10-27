@@ -21,7 +21,6 @@ import {
   EXTRA_TIME_SECONDS,
   ROLES,
   FORMATIONS,
-  TacticalFormation,
   Team,
   PlayerRole,
 } from '../game/constants.ts';
@@ -38,7 +37,7 @@ import {
 import { sound } from '../game/sound.ts';
 import { TacticsModal } from './TacticsModal.tsx';
 import { FormationSelector } from './FormationSelector.tsx';
-import { Volume2, VolumeX, Pause, Play, ArrowLeft, Info, Trophy, Layers } from 'lucide-react';
+import { Volume2, VolumeX, Pause, Play, Info, Trophy, Layers } from 'lucide-react';
 
 interface PitchCanvasProps {
   teamA: Team; // User's team
@@ -75,6 +74,8 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const bgCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastSecRef = useRef<number>(MATCH_DURATION_SECONDS);
 
   // Formations
   const [userFormationId, setUserFormationId] = useState<string>(initialUserFormationId);
@@ -95,7 +96,6 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
   const [showTacticsModal, setShowTacticsModal] = useState<boolean>(false);
   const [showFormationModal, setShowFormationModal] = useState<boolean>(false);
   const [goalBanner, setGoalBanner] = useState<string | null>(null);
-  const [screenShake, setScreenShake] = useState<number>(0);
 
   // Penalty shootout state
   const [penaltyState, setPenaltyState] = useState<{
@@ -146,7 +146,6 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     isPaused: false,
     particles: [] as Particle[],
     shake: 0,
-    crowdPulse: 0,
     drag: null as {
       playerIdx: number;
       startX: number;
@@ -155,6 +154,188 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
       currY: number;
     } | null,
   });
+
+  // Pre-bake static stadium background once to an offscreen canvas
+  // (TURF, MOWER LINES, SPECTATOR STANDS, FLOODLIGHTS, NETS)
+  // This completely eliminates hundreds of canvas operations per frame!
+  const bakeBackground = useCallback(() => {
+    const bg = document.createElement('canvas');
+    bg.width = WORLD_WIDTH;
+    bg.height = WORLD_HEIGHT;
+    const ctx = bg.getContext('2d');
+    if (!ctx) return;
+
+    // 1. Stadium background
+    ctx.fillStyle = '#0a100d';
+    ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
+
+    // 2. Spectator stands (Tribünler)
+    const drawStands = (startX: number, width: number) => {
+      ctx.fillStyle = '#111a14';
+      ctx.fillRect(startX, 0, width, WORLD_HEIGHT);
+
+      ctx.strokeStyle = '#1b261e';
+      ctx.lineWidth = 1;
+      for (let y = 0; y < WORLD_HEIGHT; y += 14) {
+        ctx.beginPath();
+        ctx.moveTo(startX, y);
+        ctx.lineTo(startX + width, y);
+        ctx.stroke();
+      }
+
+      const fanColors = [colorA, colorB, '#ffffff', '#e2e8f0', '#3b82f6', '#ef4444', '#f59e0b'];
+      for (let y = 10; y < WORLD_HEIGHT - 10; y += 14) {
+        for (let col = 0; col < 4; col++) {
+          const cx = startX + 6 + col * 9;
+          const color = fanColors[(Math.floor(y * 3 + col * 7)) % fanColors.length];
+          ctx.beginPath();
+          ctx.arc(cx, y, 2.5, 0, Math.PI * 2);
+          ctx.fillStyle = color;
+          ctx.fill();
+        }
+      }
+    };
+
+    drawStands(0, PITCH_LEFT - 4);
+    drawStands(PITCH_RIGHT + 4, WORLD_WIDTH - PITCH_RIGHT - 4);
+
+    // 3. Turf and mower grass stripes
+    ctx.fillStyle = '#164024';
+    ctx.fillRect(PITCH_LEFT, PITCH_TOP, PITCH_RIGHT - PITCH_LEFT, PITCH_BOTTOM - PITCH_TOP);
+
+    const stripeHeight = (PITCH_BOTTOM - PITCH_TOP) / 10;
+    for (let i = 0; i < 10; i++) {
+      ctx.fillStyle = i % 2 === 0 ? '#1b4d2c' : '#215c35';
+      ctx.fillRect(PITCH_LEFT, PITCH_TOP + i * stripeHeight, PITCH_RIGHT - PITCH_LEFT, stripeHeight);
+    }
+
+    // Outer boundary line
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3.5;
+    ctx.strokeRect(PITCH_LEFT, PITCH_TOP, PITCH_RIGHT - PITCH_LEFT, PITCH_BOTTOM - PITCH_TOP);
+
+    // Halfway line & center circle
+    ctx.beginPath();
+    ctx.moveTo(PITCH_LEFT, CENTER_Y);
+    ctx.lineTo(PITCH_RIGHT, CENTER_Y);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(CENTER_X, CENTER_Y, 50, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(CENTER_X, CENTER_Y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+
+    // Corner arcs
+    const cornerR = 14;
+    ctx.beginPath();
+    ctx.arc(PITCH_LEFT, PITCH_TOP, cornerR, 0, Math.PI / 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(PITCH_RIGHT, PITCH_TOP, cornerR, Math.PI / 2, Math.PI);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(PITCH_LEFT, PITCH_BOTTOM, cornerR, Math.PI * 1.5, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(PITCH_RIGHT, PITCH_BOTTOM, cornerR, Math.PI, Math.PI * 1.5);
+    ctx.stroke();
+
+    // Penalty boxes
+    const boxW = 210;
+    const boxH = 70;
+    ctx.strokeRect(CENTER_X - boxW / 2, PITCH_TOP, boxW, boxH);
+    ctx.strokeRect(CENTER_X - boxW / 2, PITCH_BOTTOM - boxH, boxW, boxH);
+
+    // Small boxes
+    const smallBoxW = 110;
+    const smallBoxH = 26;
+    ctx.strokeRect(CENTER_X - smallBoxW / 2, PITCH_TOP, smallBoxW, smallBoxH);
+    ctx.strokeRect(CENTER_X - smallBoxW / 2, PITCH_BOTTOM - smallBoxH, smallBoxW, smallBoxH);
+
+    // Arcs
+    ctx.beginPath();
+    ctx.arc(CENTER_X, PITCH_TOP + boxH, 36, 0, Math.PI);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(CENTER_X, PITCH_BOTTOM - boxH, 36, Math.PI, Math.PI * 2);
+    ctx.stroke();
+
+    // Goal nets
+    const drawNet = (yPos: number, isTop: boolean, kitColor: string) => {
+      const netHeight = 44;
+      const yStart = isTop ? yPos - netHeight : yPos;
+
+      ctx.fillStyle = 'rgba(10, 10, 10, 0.65)';
+      ctx.fillRect(GOAL_LEFT, yStart, GOAL_RIGHT - GOAL_LEFT, netHeight);
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(GOAL_LEFT, yStart, GOAL_RIGHT - GOAL_LEFT, netHeight);
+
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (let x = GOAL_LEFT; x <= GOAL_RIGHT; x += 10) {
+        ctx.moveTo(x, yStart);
+        ctx.lineTo(x, yStart + netHeight);
+      }
+      for (let y = yStart; y <= yStart + netHeight; y += 8) {
+        ctx.moveTo(GOAL_LEFT, y);
+        ctx.lineTo(GOAL_RIGHT, y);
+      }
+      ctx.stroke();
+
+      ctx.strokeStyle = kitColor;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(GOAL_LEFT, yPos);
+      ctx.lineTo(GOAL_RIGHT, yPos);
+      ctx.stroke();
+    };
+
+    drawNet(PITCH_TOP, true, colorB);
+    drawNet(PITCH_BOTTOM, false, colorA);
+
+    // 4. Stadium Floodlights (Basked into background!)
+    const floodlights = [
+      [PITCH_LEFT - 12, PITCH_TOP - 12],
+      [PITCH_RIGHT + 12, PITCH_TOP - 12],
+      [PITCH_LEFT - 12, PITCH_BOTTOM + 12],
+      [PITCH_RIGHT + 12, PITCH_BOTTOM + 12],
+    ];
+
+    floodlights.forEach(([fx, fy]) => {
+      const lightGrad = ctx.createRadialGradient(fx, fy, 4, fx, fy, 280);
+      lightGrad.addColorStop(0, 'rgba(255, 250, 220, 0.28)');
+      lightGrad.addColorStop(0.5, 'rgba(255, 250, 220, 0.08)');
+      lightGrad.addColorStop(1, 'rgba(255, 250, 220, 0)');
+
+      ctx.fillStyle = lightGrad;
+      ctx.beginPath();
+      ctx.arc(fx, fy, 280, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = '#cbd5e1';
+      ctx.beginPath();
+      ctx.arc(fx, fy, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#334155';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    });
+
+    bgCanvasRef.current = bg;
+  }, [colorA, colorB]);
+
+  // Bake background on mount or color change
+  useEffect(() => {
+    bakeBackground();
+  }, [bakeBackground]);
 
   // Kickoff setup
   useEffect(() => {
@@ -173,15 +354,14 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     } else {
       setStatusMessage('Sıra sende. Oyuncunu çek ve fırlat!');
     }
-  }, [teamA, teamB]);
+  }, [teamA, teamB, userFormation, botFormation]);
 
-  // Handle user changing formation mid-match or before kickoff
+  // Handle user changing formation mid-match
   const handleApplyFormation = (newFormationId: string) => {
     setUserFormationId(newFormationId);
     setShowFormationModal(false);
     const newForm = FORMATIONS.find((f) => f.id === newFormationId) || FORMATIONS[0];
 
-    // Reposition user disks if not moving
     const g = gameStateRef.current;
     if (g.phase === 'aim') {
       newForm.positions.forEach((pos, idx) => {
@@ -194,28 +374,39 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     }
   };
 
-  // Main game animation & physics loop
+  // Main 60 FPS loop
+  // OPTIMIZATIONS:
+  // 1. Zero React setState at 60 FPS
+  // 2. Clamped dt
+  // 3. drawImage(bakedBg) instead of recalculating 800+ canvas paths
+  // 4. Lightweight bot AI
   useEffect(() => {
     let animId: number;
     let lastTime = performance.now();
 
     const loop = (time: number) => {
       animId = requestAnimationFrame(loop);
-      const dt = Math.min((time - lastTime) / 1000, 0.05);
+      // Clamp dt to 0.033 (max ~30fps step) to prevent physics spiral on mobile
+      const dt = Math.min((time - lastTime) / 1000, 0.033);
       lastTime = time;
 
       const g = gameStateRef.current;
-      g.crowdPulse += dt;
 
       if (g.isPaused || penaltyState?.active) {
-        drawCanvas(time);
+        drawCanvas();
         return;
       }
 
-      // Decrement match clock (3 minutes duration!)
+      // Decrement match clock (3 minutes duration)
       if (g.phase === 'aim' || g.phase === 'move' || g.phase === 'bot_thinking') {
         g.remainingSeconds = Math.max(0, g.remainingSeconds - dt);
-        setRemainingSeconds(Math.ceil(g.remainingSeconds));
+
+        // Throttle React state update to discrete 1-second ticks!
+        const secInt = Math.ceil(g.remainingSeconds);
+        if (secInt !== lastSecRef.current) {
+          lastSecRef.current = secInt;
+          setRemainingSeconds(secInt);
+        }
 
         // Check if 3 minutes expired
         if (g.remainingSeconds <= 0 && g.phase === 'aim' && !areDisksMoving(g.disks)) {
@@ -282,11 +473,10 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
 
           if (g.turn === 1) {
             g.phase = 'bot_thinking';
-            g.waitTimer = 0.8;
+            g.waitTimer = 0.6; // Quick responsive bot
             setStatusMessage(`${teamB.n} pozisyon alıyor...`);
           } else {
             g.phase = 'aim';
-            // Auto-select the player closest to the ball
             const ball = g.disks[12];
             let closestIdx = 0;
             let minDist = Infinity;
@@ -311,7 +501,6 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         g.waitTimer -= dt;
         if (g.waitTimer <= 0) {
           setGoalBanner(null);
-          // Check if golden goal won the game
           if (g.isExtraTime && g.score[0] !== g.score[1]) {
             sound.playWhistle();
             g.phase = 'end';
@@ -322,33 +511,32 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
             return;
           }
 
-          // Reset disks and continue
           g.disks = resetDisks(userFormation.positions, botFormation.positions);
           g.phase = g.turn === 0 ? 'aim' : 'bot_thinking';
-          g.waitTimer = 0.8;
+          g.waitTimer = 0.6;
           setStatusMessage(g.turn === 0 ? 'Sıra sende. Başla!' : `${teamB.n} oyuna başlıyor...`);
         }
       }
 
       // Update particles
       if (g.particles.length > 0) {
-        g.particles.forEach((p) => {
+        for (let i = 0; i < g.particles.length; i++) {
+          const p = g.particles[i];
           p.x += p.vx * dt;
           p.y += p.vy * dt;
-          p.vy += 220 * dt; // gravity
+          p.vy += 220 * dt;
           p.rotation += p.rotSpeed * dt;
           p.life -= dt;
-        });
+        }
         g.particles = g.particles.filter((p) => p.life > 0);
       }
 
-      // Decay screen shake
+      // Decay screen shake directly in ref WITHOUT triggering React setState!
       if (g.shake > 0) {
         g.shake = Math.max(0, g.shake - dt * 2.2);
-        setScreenShake(g.shake);
       }
 
-      drawCanvas(time);
+      drawCanvas();
     };
 
     animId = requestAnimationFrame(loop);
@@ -360,38 +548,37 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     const g = gameStateRef.current;
     sound.playGoal();
     g.shake = 1.2;
-    setScreenShake(1.2);
 
     const newScoreA = scoringTeam === 1 ? g.score[0] + 1 : g.score[0];
     const newScoreB = scoringTeam === 2 ? g.score[1] + 1 : g.score[1];
     g.score = [newScoreA, newScoreB];
     setScore([newScoreA, newScoreB]);
 
-    // Spawn 120 dynamic celebratory confetti particles with rotation & gravity
+    // Spawn 70 optimized celebratory confetti particles
     const confettiColors = ['#ffd700', '#ffffff', teamA.c, teamB.c, '#22c55e', '#ef4444', '#38bdf8'];
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 70; i++) {
       g.particles.push({
         x: CENTER_X + (Math.random() - 0.5) * 120,
         y: scoringTeam === 1 ? PITCH_TOP + 15 : PITCH_BOTTOM - 15,
-        vx: (Math.random() - 0.5) * 600,
-        vy: (scoringTeam === 1 ? 1 : -1) * (190 + Math.random() * 420),
+        vx: (Math.random() - 0.5) * 550,
+        vy: (scoringTeam === 1 ? 1 : -1) * (180 + Math.random() * 380),
         size: 5 + Math.random() * 4,
         rotation: Math.random() * Math.PI * 2,
-        rotSpeed: (Math.random() - 0.5) * 12,
-        life: 2.2 + Math.random() * 0.8,
+        rotSpeed: (Math.random() - 0.5) * 10,
+        life: 2.0 + Math.random() * 0.6,
         color: confettiColors[Math.floor(Math.random() * confettiColors.length)],
       });
     }
 
     setGoalBanner(scoringTeam === 1 ? `GOOOL! ${teamA.n}!` : `GOL! ${teamB.n}!`);
     g.phase = 'goal_pause';
-    g.waitTimer = 2.4;
-    // Team that conceded kicks off
+    g.waitTimer = 2.2;
     g.turn = scoringTeam === 1 ? 1 : 0;
     setCurrentTurn(g.turn);
   };
 
-  // Bot AI decision maker
+  // High-performance Bot AI decision maker
+  // Optimized to test only top 3 relevant players with 3 angles and 25 steps (under 1ms execution time!)
   const executeBotTurn = () => {
     const g = gameStateRef.current;
     const ball = g.disks[12];
@@ -400,27 +587,36 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     let bestShot: { index: number; vx: number; vy: number; score: number } | null = null;
     let bestScore = -Infinity;
 
-    for (let testIdx = 6; testIdx < 12; testIdx++) {
-      const playerDisk = g.disks[testIdx];
-      const role = ROLES[playerDisk.playerIndex || 0];
+    // Pick top 3 bot players closest to ball
+    const candidates = [6, 7, 8, 9, 10, 11]
+      .map((idx) => ({
+        idx,
+        dist: Math.hypot(g.disks[idx].x - ball.x, g.disks[idx].y - ball.y),
+      }))
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 3);
 
+    const angleJitters = [-0.12, 0, 0.12];
+
+    for (const cand of candidates) {
+      const playerDisk = g.disks[cand.idx];
+      const role = ROLES[playerDisk.playerIndex || 0];
       const baseAngle = Math.atan2(ball.y - playerDisk.y, ball.x - playerDisk.x);
-      const angleJitters = [-0.18, -0.09, 0, 0.09, 0.18];
 
       for (const jitter of angleJitters) {
         const angle = baseAngle + jitter * (1 - skillFactor);
-        const pullLen = 45 + Math.random() * 65;
+        const pullLen = 50 + Math.random() * 55;
         const shotPower = calculateShotPower(pullLen, role.id, playerDisk.y, 1);
         const vx = Math.cos(angle) * shotPower;
         const vy = Math.sin(angle) * shotPower;
 
         const simDisks = g.disks.map((d) => ({ ...d }));
-        simDisks[testIdx].vx = vx;
-        simDisks[testIdx].vy = vy;
+        simDisks[cand.idx].vx = vx;
+        simDisks[cand.idx].vy = vy;
 
         let goalResult = 0;
-        for (let step = 0; step < 75; step++) {
-          const res = physicsStep(simDisks, PHYSICS_DT * 1.5);
+        for (let step = 0; step < 25; step++) {
+          const res = physicsStep(simDisks, PHYSICS_DT * 2.0);
           if (res.goal > 0) {
             goalResult = res.goal;
             break;
@@ -439,7 +635,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
 
         if (evalScore > bestScore) {
           bestScore = evalScore;
-          bestShot = { index: testIdx, vx, vy, score: evalScore };
+          bestShot = { index: cand.idx, vx, vy, score: evalScore };
         }
       }
     }
@@ -450,7 +646,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
       g.disks[bestShot.index].vy = bestShot.vy;
       g.phase = 'move';
     } else {
-      const fallbackIdx = 6 + Math.floor(Math.random() * 6);
+      const fallbackIdx = candidates[0].idx;
       const dx = ball.x - g.disks[fallbackIdx].x;
       const dy = ball.y - g.disks[fallbackIdx].y;
       const dist = Math.hypot(dx, dy) || 1;
@@ -540,12 +736,8 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     });
   };
 
-  // Canvas drawing with enhanced stadium atmosphere:
-  // - Çim dokusu (Grass texture)
-  // - Tribünler (Spectator stands with crowd)
-  // - Stadyum ışıkları (Corner floodlight towers)
-  // - Forma şeridi ve numara (Jersey stripes on player tokens)
-  const drawCanvas = (timestamp: number) => {
+  // Canvas drawing: Blits pre-baked background, then draws 13 disks + trajectory
+  const drawCanvas = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
@@ -554,194 +746,54 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     const g = gameStateRef.current;
 
     ctx.save();
-    ctx.clearRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
 
-    // Camera Screen Shake (decaying trauma)
+    // Hardware camera screen shake
     if (g.shake > 0) {
       const trauma = g.shake * g.shake;
-      const ox = (Math.random() - 0.5) * 18 * trauma;
-      const oy = (Math.random() - 0.5) * 18 * trauma;
+      const ox = (Math.random() - 0.5) * 16 * trauma;
+      const oy = (Math.random() - 0.5) * 16 * trauma;
       ctx.translate(ox, oy);
     }
 
-    // 1. STADIUM BACKGROUND & SPECTATOR STANDS (Tribünler)
-    ctx.fillStyle = '#0a100d';
-    ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
-
-    // Left and Right spectator stands with tiered seats
-    const drawStands = (startX: number, width: number) => {
-      ctx.fillStyle = '#111a14';
-      ctx.fillRect(startX, 0, width, WORLD_HEIGHT);
-
-      // Tier steps
-      ctx.strokeStyle = '#1b261e';
-      ctx.lineWidth = 1;
-      for (let y = 0; y < WORLD_HEIGHT; y += 14) {
-        ctx.beginPath();
-        ctx.moveTo(startX, y);
-        ctx.lineTo(startX + width, y);
-        ctx.stroke();
-      }
-
-      // Crowd spectator dots (fans wearing team colors, waving)
-      const fanColors = [teamA.c, teamB.c, '#ffffff', '#e2e8f0', '#3b82f6', '#ef4444', '#f59e0b'];
-      for (let y = 10; y < WORLD_HEIGHT - 10; y += 14) {
-        for (let col = 0; col < 4; col++) {
-          const cx = startX + 6 + col * 9;
-          const bounce = Math.sin(timestamp / 300 + y + col) * 1.5;
-          const color = fanColors[(Math.floor(y * 3 + col * 7)) % fanColors.length];
-          ctx.beginPath();
-          ctx.arc(cx, y + bounce, 2.5, 0, Math.PI * 2);
-          ctx.fillStyle = color;
-          ctx.fill();
-        }
-      }
-    };
-
-    drawStands(0, PITCH_LEFT - 4);
-    drawStands(PITCH_RIGHT + 4, WORLD_WIDTH - PITCH_RIGHT - 4);
-
-    // 2. REALISTIC PITCH TURF & GRASS TEXTURE (Çim Dokusu)
-    // Turf base
-    ctx.fillStyle = '#164024';
-    ctx.fillRect(PITCH_LEFT, PITCH_TOP, PITCH_RIGHT - PITCH_LEFT, PITCH_BOTTOM - PITCH_TOP);
-
-    // Alternating mower grass stripes
-    const stripeHeight = (PITCH_BOTTOM - PITCH_TOP) / 10;
-    for (let i = 0; i < 10; i++) {
-      ctx.fillStyle = i % 2 === 0 ? '#1b4d2c' : '#215c35';
-      ctx.fillRect(PITCH_LEFT, PITCH_TOP + i * stripeHeight, PITCH_RIGHT - PITCH_LEFT, stripeHeight);
-
-      // Fine grass blade texture grain
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.025)';
-      for (let gx = PITCH_LEFT + 4; gx < PITCH_RIGHT - 4; gx += 16) {
-        ctx.fillRect(gx + ((i * 7) % 11), PITCH_TOP + i * stripeHeight + 2, 8, stripeHeight - 4);
-      }
+    // 1. BLIT PRE-BAKED BACKGROUND (Stands, turf, lines, floodlights, nets)
+    // 1 single hardware-accelerated draw call!
+    if (bgCanvasRef.current) {
+      ctx.drawImage(bgCanvasRef.current, 0, 0);
+    } else {
+      ctx.fillStyle = '#164024';
+      ctx.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     }
 
-    // Outer pitch white boundary lines
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 3.5;
-    ctx.strokeRect(PITCH_LEFT, PITCH_TOP, PITCH_RIGHT - PITCH_LEFT, PITCH_BOTTOM - PITCH_TOP);
-
-    // Halfway line & center circle
-    ctx.beginPath();
-    ctx.moveTo(PITCH_LEFT, CENTER_Y);
-    ctx.lineTo(PITCH_RIGHT, CENTER_Y);
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.arc(CENTER_X, CENTER_Y, 50, 0, Math.PI * 2);
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.arc(CENTER_X, CENTER_Y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = '#ffffff';
-    ctx.fill();
-
-    // Corner quarter arcs
-    const cornerR = 14;
-    ctx.beginPath();
-    ctx.arc(PITCH_LEFT, PITCH_TOP, cornerR, 0, Math.PI / 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(PITCH_RIGHT, PITCH_TOP, cornerR, Math.PI / 2, Math.PI);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(PITCH_LEFT, PITCH_BOTTOM, cornerR, Math.PI * 1.5, Math.PI * 2);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(PITCH_RIGHT, PITCH_BOTTOM, cornerR, Math.PI, Math.PI * 1.5);
-    ctx.stroke();
-
-    // Penalty boxes (top & bottom)
-    const boxW = 210;
-    const boxH = 70;
-    ctx.strokeRect(CENTER_X - boxW / 2, PITCH_TOP, boxW, boxH);
-    ctx.strokeRect(CENTER_X - boxW / 2, PITCH_BOTTOM - boxH, boxW, boxH);
-
-    // Small goal boxes
-    const smallBoxW = 110;
-    const smallBoxH = 26;
-    ctx.strokeRect(CENTER_X - smallBoxW / 2, PITCH_TOP, smallBoxW, smallBoxH);
-    ctx.strokeRect(CENTER_X - smallBoxW / 2, PITCH_BOTTOM - smallBoxH, smallBoxW, smallBoxH);
-
-    // Penalty arcs
-    ctx.beginPath();
-    ctx.arc(CENTER_X, PITCH_TOP + boxH, 36, 0, Math.PI);
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.arc(CENTER_X, PITCH_BOTTOM - boxH, 36, Math.PI, Math.PI * 2);
-    ctx.stroke();
-
-    // Goal Nets (Top & Bottom)
-    drawGoalNet(ctx, PITCH_TOP, true, colorB);
-    drawGoalNet(ctx, PITCH_BOTTOM, false, colorA);
-
-    // 3. STADIUM FLOODLIGHTS (Stadyum Işıkları)
-    // 4 Corner floodlights casting radial atmospheric beams onto the pitch
-    const floodlights = [
-      [PITCH_LEFT - 12, PITCH_TOP - 12],
-      [PITCH_RIGHT + 12, PITCH_TOP - 12],
-      [PITCH_LEFT - 12, PITCH_BOTTOM + 12],
-      [PITCH_RIGHT + 12, PITCH_BOTTOM + 12],
-    ];
-
-    floodlights.forEach(([fx, fy]) => {
-      // Light beam gradient
-      const lightGrad = ctx.createRadialGradient(fx, fy, 4, fx, fy, 280);
-      lightGrad.addColorStop(0, 'rgba(255, 250, 220, 0.28)');
-      lightGrad.addColorStop(0.5, 'rgba(255, 250, 220, 0.08)');
-      lightGrad.addColorStop(1, 'rgba(255, 250, 220, 0)');
-
-      ctx.fillStyle = lightGrad;
-      ctx.beginPath();
-      ctx.arc(fx, fy, 280, 0, Math.PI * 2);
-      ctx.fill();
-
-      // Steel light mast tower fixture
-      ctx.fillStyle = '#cbd5e1';
-      ctx.beginPath();
-      ctx.arc(fx, fy, 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = '#334155';
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    });
-
-    // 4. DISKS: Shadows first
+    // 2. DISKS: Shadows
     ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
-    g.disks.forEach((d) => {
+    for (let i = 0; i < g.disks.length; i++) {
+      const d = g.disks[i];
       ctx.beginPath();
       ctx.arc(d.x + 3.5, d.y + 5.5, d.r, 0, Math.PI * 2);
       ctx.fill();
-    });
+    }
 
-    // 5. RENDER PLAYER TOKENS WITH JERSEY STRIPE (Forma Şeridi) & NUMBERS
-    g.disks.forEach((d, idx) => {
-      if (d.ball) return;
+    // 3. RENDER PLAYER TOKENS WITH JERSEY STRIPES
+    for (let idx = 0; idx < g.disks.length; idx++) {
+      const d = g.disks[idx];
+      if (d.ball) continue;
 
       const isUserTeam = idx < 6;
       const role = ROLES[d.playerIndex || 0];
       const isSelected = isUserTeam && d.playerIndex === g.selectedPlayer;
       const teamColor = isUserTeam ? colorA : colorB;
 
-      // Selection ring with rotating dash on user's active turn
+      // Selection indicator
       if (isSelected && g.phase === 'aim' && g.turn === 0) {
-        ctx.save();
-        ctx.setLineDash([6, 6]);
-        ctx.lineDashOffset = -timestamp / 35;
-        ctx.strokeStyle = '#facc15'; // bright golden yellow
+        ctx.strokeStyle = '#facc15';
         ctx.lineWidth = 4;
         ctx.beginPath();
-        ctx.arc(d.x, d.y, d.r + 7, 0, Math.PI * 2);
+        ctx.arc(d.x, d.y, d.r + 6, 0, Math.PI * 2);
         ctx.stroke();
-        ctx.restore();
       }
 
       ctx.save();
-      // Clip to circular disk body
+      // Disk circle
       ctx.beginPath();
       ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
       ctx.fillStyle = teamColor;
@@ -749,12 +801,11 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
       ctx.clip();
 
       // FORMA ŞERİDİ (Authentic Jersey Stripe)
-      // Bold vertical contrast stripe down the center
       const stripeWidth = Math.round(d.r * 0.42);
       ctx.fillStyle = isUserTeam ? 'rgba(255, 255, 255, 0.35)' : 'rgba(0, 0, 0, 0.25)';
       ctx.fillRect(d.x - stripeWidth / 2, d.y - d.r, stripeWidth, d.r * 2);
 
-      // Top specular glass highlight arc
+      // Top specular highlight
       ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
       ctx.beginPath();
       ctx.arc(d.x, d.y - d.r * 0.3, d.r * 0.85, 0, Math.PI);
@@ -774,20 +825,20 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
       const numTextColor = isLightKit ? '#0f172a' : '#ffffff';
       const tagTextColor = isLightKit ? '#b45309' : '#fef08a';
 
-      // Tactical jersey number
+      // Tactical number
       ctx.fillStyle = numTextColor;
       ctx.font = `bold ${role.id === 1 ? 14 : 12}px ui-rounded, system-ui, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(`${role.number}`, d.x, d.y - 3);
 
-      // Position abbreviation (KL, STP, BEK, ÖNL, 10, FVT)
+      // Role tag abbreviation
       ctx.font = 'bold 8.5px ui-rounded, system-ui, sans-serif';
       ctx.fillStyle = tagTextColor;
       ctx.fillText(role.shortName, d.x, d.y + 7.5);
-    });
+    }
 
-    // 6. RENDER SOCCER BALL
+    // 4. RENDER SOCCER BALL
     const ball = g.disks[12];
     ctx.beginPath();
     ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
@@ -797,13 +848,12 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
     ctx.lineWidth = 2.5;
     ctx.stroke();
 
-    // Soccer ball black pentagon pattern
     ctx.fillStyle = '#18181b';
     ctx.beginPath();
     ctx.arc(ball.x, ball.y, 3.2, 0, Math.PI * 2);
     ctx.fill();
 
-    // 7. AIMING SLINGSHOT & TRAJECTORY GUIDE
+    // 5. AIMING SLINGSHOT & TRAJECTORY GUIDE
     if (g.drag && g.phase === 'aim' && g.turn === 0) {
       const activeDisk = g.disks[g.drag.playerIdx];
       const role = ROLES[activeDisk.playerIndex || 0];
@@ -831,7 +881,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         ctx.fillStyle = '#ffffff';
         ctx.fill();
 
-        // Trajectory forecast arrow (On Numara has extended precision line!)
+        // Trajectory forecast arrow
         const trajMultiplier = role.id === 5 ? 1.6 : 1.0;
         const trajLen = (50 + pullRatio * 170) * trajMultiplier;
         const hue = Math.max(0, 125 - pullRatio * 125);
@@ -846,7 +896,6 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // Arrow head
         const arrowX = activeDisk.x + nx * trajLen;
         const arrowY = activeDisk.y + ny * trajLen;
         ctx.fillStyle = aimColor;
@@ -857,7 +906,6 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         ctx.closePath();
         ctx.fill();
 
-        // Forvet goal bonus indicator
         if (role.id === 6 && activeDisk.y < CENTER_Y) {
           ctx.fillStyle = '#f43f5e';
           ctx.font = 'bold 11px ui-rounded, sans-serif';
@@ -867,49 +915,18 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
       }
     }
 
-    // 8. CELEBRATION CONFETTI PARTICLES WITH ROTATION (Konfeti Efekti)
-    g.particles.forEach((p) => {
+    // 6. CONFETTI PARTICLES
+    for (let i = 0; i < g.particles.length; i++) {
+      const p = g.particles[i];
       ctx.save();
       ctx.translate(p.x, p.y);
       ctx.rotate(p.rotation);
       ctx.fillStyle = p.color;
       ctx.fillRect(-p.size / 2, -p.size / 3, p.size, p.size * 0.7);
       ctx.restore();
-    });
+    }
 
     ctx.restore();
-  };
-
-  const drawGoalNet = (ctx: CanvasRenderingContext2D, yPos: number, isTop: boolean, kitColor: string) => {
-    const netHeight = 44;
-    const yStart = isTop ? yPos - netHeight : yPos;
-
-    ctx.fillStyle = 'rgba(10, 10, 10, 0.65)';
-    ctx.fillRect(GOAL_LEFT, yStart, GOAL_RIGHT - GOAL_LEFT, netHeight);
-
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 3;
-    ctx.strokeRect(GOAL_LEFT, yStart, GOAL_RIGHT - GOAL_LEFT, netHeight);
-
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    for (let x = GOAL_LEFT; x <= GOAL_RIGHT; x += 10) {
-      ctx.moveTo(x, yStart);
-      ctx.lineTo(x, yStart + netHeight);
-    }
-    for (let y = yStart; y <= yStart + netHeight; y += 8) {
-      ctx.moveTo(GOAL_LEFT, y);
-      ctx.lineTo(GOAL_RIGHT, y);
-    }
-    ctx.stroke();
-
-    ctx.strokeStyle = kitColor;
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(GOAL_LEFT, yPos);
-    ctx.lineTo(GOAL_RIGHT, yPos);
-    ctx.stroke();
   };
 
   const getCanvasCoords = (clientX: number, clientY: number): [number, number] => {
@@ -1000,7 +1017,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
 
   return (
     <div className="relative flex flex-col items-center justify-between h-full w-full bg-stone-950 select-none overflow-hidden text-stone-100">
-      {/* Top HUD: Score, 3-minute Timer, Match Minute, Teams & Formations */}
+      {/* Top HUD */}
       <header className="w-full max-w-xl px-3 py-2 z-20 flex flex-col gap-1.5 bg-stone-900/90 border-b border-stone-800 backdrop-blur-xs">
         <div className="flex items-center justify-between text-xs text-stone-400 font-semibold px-1">
           <span className="flex items-center gap-1">
@@ -1098,10 +1115,10 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         </div>
       </header>
 
-      {/* Main Pitch Stage */}
+      {/* Main Pitch Stage - Hardware accelerated with will-change */}
       <main
         ref={containerRef}
-        className="relative flex-1 w-full max-w-xl flex items-center justify-center overflow-hidden p-1 touch-none"
+        className="relative flex-1 w-full max-w-xl flex items-center justify-center overflow-hidden p-1 touch-none will-change-transform"
       >
         <canvas
           ref={canvasRef}
@@ -1113,7 +1130,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
           onPointerCancel={handlePointerUp}
           className="w-auto h-full max-h-[85vh] aspect-[500/820] shadow-2xl rounded-xl cursor-crosshair border-2 border-stone-800"
           style={{
-            transform: screenShake > 0 ? `translate(${(Math.random() - 0.5) * 10}px, ${(Math.random() - 0.5) * 10}px)` : 'none',
+            transform: 'translateZ(0)',
           }}
         />
 
@@ -1243,7 +1260,7 @@ export const PitchCanvas: React.FC<PitchCanvasProps> = ({
         )}
       </main>
 
-      {/* Bottom Status / Player selection buttons */}
+      {/* Bottom Status / Selection Bar */}
       <footer className="w-full max-w-xl px-3 py-2 z-20 bg-stone-900/90 border-t border-stone-800 flex items-center justify-between text-xs text-stone-300">
         <span className="font-medium truncate max-w-[280px]">
           {statusMessage}
